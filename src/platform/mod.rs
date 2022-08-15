@@ -18,3 +18,33 @@ pub use self::unix::*;
 
 #[cfg(windows)]
 pub use self::windows::*;
+
+use std::cell::UnsafeCell;
+
+#[repr(transparent)]
+pub struct SyncUnsafeCell<T: ?Sized> {
+    value: UnsafeCell<T>,
+}
+
+unsafe impl<T: ?Sized> Sync for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    /// Constructs a new instance of `SyncUnsafeCell` which will wrap the specified value.
+    #[inline]
+    pub const fn new(value: T) -> Self {
+        Self {
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    /// Gets a mutable pointer to the wrapped value.
+    ///
+    /// This can be cast to a pointer of any kind.
+    /// Ensure that the access is unique (no active references, mutable or not)
+    /// when casting to `&mut T`, and ensure that there are no mutations
+    /// or mutable aliases going on when casting to `&T`
+    #[inline]
+    pub const fn get(&self) -> *mut T {
+        self.value.get()
+    }
+}

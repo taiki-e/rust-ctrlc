@@ -7,13 +7,14 @@
 // notice may not be copied, modified, or distributed except
 // according to those terms.
 
+use super::SyncUnsafeCell;
 use crate::error::Error as CtrlcError;
 use nix::unistd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::IntoRawFd;
 use std::os::unix::io::RawFd;
 
-static mut PIPE: (RawFd, RawFd) = (-1, -1);
+static PIPE: SyncUnsafeCell<(RawFd, RawFd)> = SyncUnsafeCell::new((-1, -1));
 
 /// Platform specific error type
 pub type Error = nix::Error;
@@ -24,7 +25,7 @@ pub type Signal = nix::sys::signal::Signal;
 extern "C" fn os_handler(_: nix::libc::c_int) {
     // Assuming this always succeeds. Can't really handle errors in any meaningful way.
     unsafe {
-        let fd = BorrowedFd::borrow_raw(PIPE.1);
+        let fd = BorrowedFd::borrow_raw((*PIPE.get()).1);
         let _ = unistd::write(fd, &[0u8]);
     }
 }
@@ -94,18 +95,21 @@ pub unsafe fn init_os_handler(overwrite: bool) -> Result<(), Error> {
     use nix::fcntl;
     use nix::sys::signal;
 
-    PIPE = pipe2(fcntl::OFlag::O_CLOEXEC)?;
+    *PIPE.get() = pipe2(fcntl::OFlag::O_CLOEXEC)?;
 
     let close_pipe = |e: nix::Error| -> Error {
         // Try to close the pipes. close() should not fail,
         // but if it does, there isn't much we can do
-        let _ = unistd::close(PIPE.1);
-        let _ = unistd::close(PIPE.0);
+        let _ = unistd::close((*PIPE.get()).1);
+        let _ = unistd::close((*PIPE.get()).0);
         e
     };
 
     // Make sure we never block on write in the os handler.
-    if let Err(e) = fcntl::fcntl(PIPE.1, fcntl::FcntlArg::F_SETFL(fcntl::OFlag::O_NONBLOCK)) {
+    if let Err(e) = fcntl::fcntl(
+        (*PIPE.get()).1,
+        fcntl::FcntlArg::F_SETFL(fcntl::OFlag::O_NONBLOCK),
+    ) {
         return Err(close_pipe(e));
     }
 
@@ -179,7 +183,7 @@ pub unsafe fn block_ctrl_c() -> Result<(), CtrlcError> {
     // with std::os::unix::io::FromRawFd, this would handle EINTR
     // and everything for us.
     loop {
-        match unistd::read(PIPE.0, &mut buf[..]) {
+        match unistd::read((*PIPE.get()).0, &mut buf[..]) {
             Ok(1) => break,
             Ok(_) => return Err(CtrlcError::System(io::ErrorKind::UnexpectedEof.into())),
             Err(nix::errno::Errno::EINTR) => {}
