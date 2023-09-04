@@ -8,25 +8,24 @@
 // according to those terms.
 
 use crate::error::Error as CtrlcError;
-use nix::unistd;
+use rustix::fs::OFlags;
 use std::os::fd::BorrowedFd;
 use std::os::fd::IntoRawFd;
+use std::os::raw::c_int;
 use std::os::unix::io::RawFd;
 
 static mut PIPE: (RawFd, RawFd) = (-1, -1);
 
 /// Platform specific error type
-pub type Error = nix::Error;
+pub type Error = rustix::io::Errno;
 
 /// Platform specific signal type
-pub type Signal = nix::sys::signal::Signal;
+pub type Signal = rustix::process::Signal;
 
-extern "C" fn os_handler(_: nix::libc::c_int) {
+extern "C" fn os_handler(_: c_int) {
     // Assuming this always succeeds. Can't really handle errors in any meaningful way.
-    unsafe {
-        let fd = BorrowedFd::borrow_raw(PIPE.1);
-        let _ = unistd::write(fd, &[0u8]);
-    }
+    let fd = unsafe { BorrowedFd::borrow_raw(PIPE.1) };
+    let _ = rustix::io::write(fd, &[0u8]);
 }
 
 // pipe2(2) is not available on macOS, iOS, AIX or Haiku, so we need to use pipe(2) and fcntl(2)
@@ -38,33 +37,28 @@ extern "C" fn os_handler(_: nix::libc::c_int) {
     target_os = "aix",
     target_os = "nto",
 ))]
-fn pipe2(flags: nix::fcntl::OFlag) -> nix::Result<(RawFd, RawFd)> {
-    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+fn pipe2(flags: OFlags) -> Result<(RawFd, RawFd), Error> {
+    use rustix::fs::{fcntl_setfd, fcntl_setfl, FdFlags};
 
-    let pipe = unistd::pipe()?;
-    let pipe = (pipe.0.into_raw_fd(), pipe.1.into_raw_fd());
+    let pipe = rustix::pipe::pipe()?;
 
-    let mut res = Ok(0);
+    let mut res = Ok(());
 
-    if flags.contains(OFlag::O_CLOEXEC) {
+    if flags.contains(OFlags::CLOEXEC) {
         res = res
-            .and_then(|_| fcntl(pipe.0, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)))
-            .and_then(|_| fcntl(pipe.1, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)));
+            .and_then(|_| fcntl_setfd(&pipe.0, FdFlags::CLOEXEC))
+            .and_then(|_| fcntl_setfd(&pipe.1, FdFlags::CLOEXEC));
     }
 
-    if flags.contains(OFlag::O_NONBLOCK) {
+    if flags.contains(OFlags::NONBLOCK) {
         res = res
-            .and_then(|_| fcntl(pipe.0, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)))
-            .and_then(|_| fcntl(pipe.1, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)));
+            .and_then(|_| fcntl_setfl(&pipe.0, OFlags::NONBLOCK))
+            .and_then(|_| fcntl_setfl(&pipe.1, OFlags::NONBLOCK));
     }
 
     match res {
-        Ok(_) => Ok(pipe),
-        Err(e) => {
-            let _ = unistd::close(pipe.0);
-            let _ = unistd::close(pipe.1);
-            Err(e)
-        }
+        Ok(_) => Ok((pipe.0.into_raw_fd(), pipe.1.into_raw_fd())),
+        Err(e) => Err(e),
     }
 }
 
@@ -76,8 +70,8 @@ fn pipe2(flags: nix::fcntl::OFlag) -> nix::Result<(RawFd, RawFd)> {
     target_os = "aix",
     target_os = "nto",
 )))]
-fn pipe2(flags: nix::fcntl::OFlag) -> nix::Result<(RawFd, RawFd)> {
-    let pipe = unistd::pipe2(flags)?;
+fn pipe2(flags: OFlags) -> Result<(RawFd, RawFd), Error> {
+    let pipe = rustix::pipe::pipe_with(flags)?;
     Ok((pipe.0.into_raw_fd(), pipe.1.into_raw_fd()))
 }
 
@@ -91,21 +85,18 @@ fn pipe2(flags: nix::fcntl::OFlag) -> nix::Result<(RawFd, RawFd)> {
 ///
 #[inline]
 pub unsafe fn init_os_handler(overwrite: bool) -> Result<(), Error> {
-    use nix::fcntl;
-    use nix::sys::signal;
+    PIPE = pipe2(OFlags::CLOEXEC)?;
 
-    PIPE = pipe2(fcntl::OFlag::O_CLOEXEC)?;
-
-    let close_pipe = |e: nix::Error| -> Error {
+    let close_pipe = |e: Error| -> Error {
         // Try to close the pipes. close() should not fail,
         // but if it does, there isn't much we can do
-        let _ = unistd::close(PIPE.1);
-        let _ = unistd::close(PIPE.0);
+        let _ = rustix::io::close(PIPE.1);
+        let _ = rustix::io::close(PIPE.0);
         e
     };
 
     // Make sure we never block on write in the os handler.
-    if let Err(e) = fcntl::fcntl(PIPE.1, fcntl::FcntlArg::F_SETFL(fcntl::OFlag::O_NONBLOCK)) {
+    if let Err(e) = rustix::fs::fcntl_setfl(BorrowedFd::borrow_raw(PIPE.1), OFlags::NONBLOCK) {
         return Err(close_pipe(e));
     }
 
@@ -121,13 +112,13 @@ pub unsafe fn init_os_handler(overwrite: bool) -> Result<(), Error> {
     let new_action =
         signal::SigAction::new(handler, signal::SaFlags::empty(), signal::SigSet::empty());
 
-    let sigint_old = match signal::sigaction(signal::Signal::SIGINT, &new_action) {
+    let sigint_old = match signal::sigaction(rustix::process::Signal::Int, &new_action) {
         Ok(old) => old,
         Err(e) => return Err(close_pipe(e)),
     };
     if !overwrite && sigint_old.handler() != signal::SigHandler::SigDfl {
-        signal::sigaction(signal::Signal::SIGINT, &sigint_old).unwrap();
-        return Err(close_pipe(nix::Error::EEXIST));
+        signal::sigaction(rustix::process::Signal::Int, &sigint_old).unwrap();
+        return Err(close_pipe(rustix::io::Errno::EXIST));
     }
 
     #[cfg(feature = "termination")]
@@ -172,17 +163,16 @@ pub unsafe fn init_os_handler(overwrite: bool) -> Result<(), Error> {
 ///
 #[inline]
 pub unsafe fn block_ctrl_c() -> Result<(), CtrlcError> {
-    use std::io;
     let mut buf = [0u8];
 
     // TODO: Can we safely convert the pipe fd into a std::io::Read
     // with std::os::unix::io::FromRawFd, this would handle EINTR
     // and everything for us.
     loop {
-        match unistd::read(PIPE.0, &mut buf[..]) {
+        match rustix::io::read(BorrowedFd::borrow_raw(PIPE.0), &mut buf[..]) {
             Ok(1) => break,
-            Ok(_) => return Err(CtrlcError::System(io::ErrorKind::UnexpectedEof.into())),
-            Err(nix::errno::Errno::EINTR) => {}
+            Ok(_) => return Err(CtrlcError::System(std::io::ErrorKind::UnexpectedEof.into())),
+            Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(e.into()),
         }
     }

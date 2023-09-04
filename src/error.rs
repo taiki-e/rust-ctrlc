@@ -25,7 +25,7 @@ impl Error {
 impl From<platform::Error> for Error {
     fn from(e: platform::Error) -> Error {
         #[cfg(not(windows))]
-        if e == platform::Error::EEXIST {
+        if e == platform::Error::EXIST {
             return Error::MultipleHandlers;
         }
 
